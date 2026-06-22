@@ -1,66 +1,118 @@
 # FST ForgePolish
 
-A specialized high-performance hard-surface smoothing and polishing toolset for Blender. 
+FST ForgePolish is a hard-surface polishing toolset for Blender, built for cleaning retopologized meshes, relaxing uneven topology, and preserving crisp mechanical boundaries before beveling, subdivision, or final sculpt cleanup.
 
-Ideal for cleaning up retopologized meshes from ZBrush, removing surface irregularities, and ensuring flawless surface fidelity before final beveling and subdivision stages.
+The 1.1.0 release adds edge-chain polishing, an interactive polish brush, a simplified selection workflow, and expanded multilingual UI support.
 
 ## Installation
 
-The addon supports **Blender 4.2 LTS through 5.1**.
+FST ForgePolish supports **Blender 4.2 LTS through 5.1**.
 
-1. Download the latest `FST_ForgePolish_v1.0.x.zip` from the [Releases](../../releases) page.
-2. Open Blender and go to **Edit > Preferences > Add-ons** (or **Extensions** in 4.2+).
-3. Click **Install...** (or the down arrow icon -> Install from Disk).
-4. Select the downloaded `.zip` file.
-5. Enable the addon by ticking the checkbox.
+1. Download the latest `fst_forgepolish-1.1.0.zip` from the [Releases](../../releases) page.
+2. Open Blender and go to **Edit > Preferences > Add-ons** or **Extensions**.
+3. Choose **Install from Disk** and select the downloaded `.zip`.
+4. Enable **FST ForgePolish**.
 
-## Where is it located in Blender?
+## Location
 
-Once installed, the FST ForgePolish panel can be accessed in the **3D Viewport**. 
-Open the Sidebar (press `N`) and navigate to the **Edit** tab. 
+Open the **3D Viewport**, press `N` to show the Sidebar, then go to the **Edit** tab.
 
-*Note: The FaceSets utility tools will only become active when you are in **Edit Mode**.*
+The Face Set utility buttons are available in **Edit Mode**. The main **Polish** operator works from Object/Edit workflows, and the brush can be launched from the same panel.
 
----
+## What Is New In 1.1.0
 
-## Workflow & Tools
+### Edge Polishing
 
-FST ForgePolish relies on identifying "inner" regions and "boundaries". You can easily define these regions using the built-in FaceSets tools.
+Select an edge chain in Edit Mode and press **Polish**. ForgePolish now detects that the active selection is an edge chain and relaxes it along its own flow instead of treating it like a face region.
 
-### 1. FaceSets Workflow (Preparation)
-To get the best polishing results on complex hard-surface models, you can isolate flat planes and curved transitions using FaceSets.
+This is useful for:
 
-* **Edges to FaceSets:** In Edit Mode, select the sharp edges that define your main surface transitions. Click this button to automatically create distinct FaceSets via a flood-fill algorithm based on your edge selection.
-* **FaceSets to Select:** Quickly re-select the boundary edges that separate your neighboring FaceSets.
+- straightening wavy panel boundaries
+- cleaning bevel support loops
+- smoothing hard-surface transition lines
+- polishing Face Set borders without changing the whole surface
 
-### 2. Polishing Modes (The Core)
-When you click **Polish**, the tool modifies the mesh topology using one of two highly optimized algorithms (calculated via NumPy for maximum performance):
+Masked vertices, locked endpoints, and corner protection are respected.
 
-* **Standard HC (Volume Preserve):** Smooths the surface while utilizing HC correction to reduce volume loss. It maintains the original proportions of your mesh while relaxing the uneven topology.
-* **Tension First (Surface Shrink):** Skips volume compensation and prioritizes tension reduction. This is an aggressive polish that shrinks the surface slightly but results in incredibly clean, sharp, and tight topology.
+### Polish Brush
 
----
+The new brush mode lets you polish locally in the viewport without repeatedly running the full mesh operator.
+
+- **Left Mouse Button** paints local polish.
+- **F** adjusts brush size.
+- **Shift+F** adjusts hardness.
+- **Ctrl+Z / Ctrl+Y** undo and redo brush strokes while the brush is active.
+- **Right Mouse Button** or **Esc** exits the brush.
+
+The brush uses the same topology-aware polish data as the main operator, respects Sculpt Mask values, and updates its overlay as you work.
+
+### Simplified Selection Flow
+
+The old separate selection toggle has been removed. ForgePolish now reads the current Edit Mode selection directly:
+
+- selected faces polish as a face region
+- selected edge chains polish as edges
+- selected vertices polish locally
+- no selection polishes the whole mesh
+
+This keeps the workflow simple: select what you want to clean, then press **Polish**.
+
+### Expanded Multilingual UI
+
+The interface now includes built-in translations for:
+
+- English
+- Chinese Simplified
+- Chinese Traditional
+- German
+- Spanish
+- French
+- Italian
+- Japanese
+- Korean
+- Polish
+- Portuguese (Brazil)
+- Russian
+- Vietnamese
+
+Brush status text, tooltips, reports, panel labels, and the new 1.1.0 controls are included in the translation tables.
+
+## Core Workflow
+
+### 1. Optional Face Set Preparation
+
+Face Sets are useful when you want ForgePolish to preserve surface islands and polish boundaries intelligently.
+
+- **Create FaceSets from Edges**: In Edit Mode, select separator edges and create Face Sets by flood fill.
+- **Select FaceSet Boundaries**: Re-select the edges separating neighboring Face Sets.
+
+You do not need Face Sets for every use case. The tool can polish the whole mesh, selected faces, selected vertices, or selected edge chains directly.
+
+### 2. Choose A Mode
+
+- **Standard HC (Volume Preserve)**: Smooths the surface while using HC correction to reduce volume loss.
+- **Tension First (Surface Shrink)**: Prioritizes tension reduction for a tighter, sharper polish with more surface shrink.
+
+### 3. Polish
+
+Use **Polish** for a one-shot operation, or use the **Polish Brush** for controlled local cleanup.
 
 ## Parameters
 
-* **Iterations:** Controls how many times the smoothing operation is repeated. Higher values result in a smoother mesh but may take slightly longer on very dense topology.
-* **Corners:** A crucial feature for hard-surface modeling. It locks boundary corners that are sharper than the specified angle, preventing your mechanical corners from melting away during the smoothing process. Set to `0` to disable.
-* **Selected:** If enabled, the tool will only polish the currently selected vertices/faces and completely lock the rest of the mesh in place.
-* **Advanced Options:**
-  Expand the advanced panel to get low-level control over the polish tuning:
-  * **Inner (Smooth / Preserve):** Adjust the single-step smoothing strength and volume preservation *inside* the continuous face sets.
-  * **Boundary (Smooth / Preserve):** Adjust the smoothing and preservation specifically on the borders separating the face sets.
+- **Polish Strength**: Shared strength for face, edge, and brush polishing.
+- **Corner Lock**: Protects sharp boundary corners. Set it to `0` to disable corner protection.
+- **Advanced**: Opens lower-level controls.
+- **Inner Smooth / Preserve**: Controls smoothing and volume preservation inside Face Set regions.
+- **Boundary Smooth / Preserve**: Controls smoothing and volume preservation along Face Set boundaries.
+- **Size**: Brush radius in screen pixels.
+- **Hardness**: Brush falloff hardness.
 
-## Multilingual Support
+## Notes
 
-FST ForgePolish automatically adapts to your Blender interface language. Built-in languages include:
-* English
-* Chinese (Simplified / Traditional)
-* Japanese
-* Spanish
-* French
-* German
-* Russian
+- Sculpt Mask values are respected by the main polish operator, edge polishing, and the polish brush.
+- Face Set boundaries can be used as polish guides without destructively splitting mesh data.
+- Topology data is cached and reused where possible for responsive repeated polishing.
 
 ## License
+
 GNU General Public License v3.0
