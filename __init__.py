@@ -1,18 +1,21 @@
 import bpy
 
-from .executor import (
+from . import i18n
+from .features.brush import MESH_OT_fst_forgepolish_smooth_brush
+from .features.brush.ops_smooth_brush import shutdown_active_smooth_brush
+from .operators.polish import (
     MESH_OT_create_facesets_from_edges,
+    MESH_OT_fst_forgepolish_groups,
     MESH_OT_select_faceset_boundaries,
-    MESH_OT_sharp_polish_groups,
 )
-from .translations import translation_dict
-from .ui import SHARPPOLISH_PG_properties, VIEW3D_PT_polish_panel
+from .ui.panel import FSTFORGEPOLISH_PG_properties, VIEW3D_PT_polish_panel
 
 classes = [
-    SHARPPOLISH_PG_properties,
+    FSTFORGEPOLISH_PG_properties,
     MESH_OT_create_facesets_from_edges,
     MESH_OT_select_faceset_boundaries,
-    MESH_OT_sharp_polish_groups,
+    MESH_OT_fst_forgepolish_groups,
+    MESH_OT_fst_forgepolish_smooth_brush,
     VIEW3D_PT_polish_panel,
 ]
 
@@ -21,17 +24,19 @@ def register():
     for cls in classes:
         bpy.utils.register_class(cls)
 
-    bpy.app.translations.register(__name__, translation_dict)
-    bpy.types.Scene.sharp_polish_props = bpy.props.PointerProperty(
-        type=SHARPPOLISH_PG_properties
+    i18n.register()
+    bpy.types.Scene.fst_forgepolish_props = bpy.props.PointerProperty(
+        type=FSTFORGEPOLISH_PG_properties
     )
 
 
 def unregister():
-    if hasattr(bpy.types.Scene, "sharp_polish_props"):
-        del bpy.types.Scene.sharp_polish_props
+    shutdown_active_smooth_brush()
 
-    bpy.app.translations.unregister(__name__)
+    if hasattr(bpy.types.Scene, "fst_forgepolish_props"):
+        del bpy.types.Scene.fst_forgepolish_props
+
+    i18n.unregister()
 
     for cls in reversed(classes):
         try:

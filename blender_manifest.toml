@@ -1,11 +1,12 @@
 schema_version = "1.0.0"
 
-id = "sharp_polish"
-version = "1.0.0"
-name = "SharpPolish"
+id = "fst_forgepolish"
+version = "1.1.0"
+name = "FST ForgePolish"
 tagline = "Hard surface polishing with optional volume preservation"
 maintainer = "YLIANG"
 type = "add-on"
+website = "https://github.com/YLIANG021/FST_ForgePolish"
 
 license = ["SPDX:GPL-3.0-or-later"]
 blender_version_min = "4.2.0"

@@ -1,24 +1,33 @@
 import bpy
 import bmesh
 import hashlib
-import math
 import traceback
-from collections import OrderedDict, defaultdict
+from collections import OrderedDict
 from enum import Enum
 
+import numpy as np
 from bpy.app.translations import pgettext_rpt as rpt_
 
-from .core_algorithms import np, run_standard_polish, run_tension_polish
+from ..core.algorithms import run_standard_polish, run_tension_polish
+from ..core.edge_algorithms import polish_selected_edge_chains
+from ..core.topology_rules import build_single_faceset_topology_data, build_topology_data
 
 
 class PolishResult(Enum):
     SUCCESS = "success"
+    WHOLE_MESH = "whole_mesh"
+    SELECTED_FACES = "selected_faces"
+    SELECTED_EDGES = "selected_edges"
+    SELECTED_EDGES_LOCKED = "selected_edges_locked"
+    SELECTED_VERTS = "selected_verts"
     NO_FACE_SET = "no_face_set"
     SINGLE_GROUP = "single_group"
 
 
 _topo_cache = OrderedDict()
 _TOPO_CACHE_LIMIT = 12
+_mesh_topology_versions = {}
+EDGE_POLISH_ITERATION_SCALE = 1.5
 
 
 def _cache_key_prefix(mesh_ptr):
@@ -26,7 +35,9 @@ def _cache_key_prefix(mesh_ptr):
 
 
 def _invalidate_mesh_cache(mesh):
-    prefix = _cache_key_prefix(int(mesh.as_pointer()))
+    mesh_ptr = int(mesh.as_pointer())
+    _mesh_topology_versions[mesh_ptr] = _mesh_topology_versions.get(mesh_ptr, 0) + 1
+    prefix = _cache_key_prefix(mesh_ptr)
     stale_keys = [key for key in _topo_cache if key.startswith(prefix)]
     for key in stale_keys:
         _topo_cache.pop(key, None)
@@ -41,75 +52,19 @@ def _hash_int_sequence(values):
     return int.from_bytes(digest, "little", signed=False)
 
 
-def _to_numpy_int_array(values):
-    return np.asarray(values, dtype=np.int32)
-
-
-def _neighbor_matrix(neighbor_lists):
-    vert_count = len(neighbor_lists)
-    max_degree = max((len(neighbors) for neighbors in neighbor_lists), default=0)
-    if max_degree == 0:
-        return (
-            np.empty((vert_count, 0), dtype=np.int32),
-            np.zeros(vert_count, dtype=np.int32),
-        )
-
-    indices = np.full((vert_count, max_degree), -1, dtype=np.int32)
-    counts = np.zeros(vert_count, dtype=np.int32)
-    for idx, neighbors in enumerate(neighbor_lists):
-        count = len(neighbors)
-        counts[idx] = count
-        if count:
-            indices[idx, :count] = neighbors
-    return indices, counts
-
-
-def _mesh_topology_signature(mesh):
-    edge_vertices = [0] * (len(mesh.edges) * 2)
-    if edge_vertices:
-        mesh.edges.foreach_get("vertices", edge_vertices)
-
-    loop_vertices = [0] * len(mesh.loops)
-    if loop_vertices:
-        mesh.loops.foreach_get("vertex_index", loop_vertices)
-
-    poly_loop_totals = [0] * len(mesh.polygons)
-    if poly_loop_totals:
-        mesh.polygons.foreach_get("loop_total", poly_loop_totals)
-
-    return (
-        _hash_int_sequence(edge_vertices),
-        _hash_int_sequence(loop_vertices),
-        _hash_int_sequence(poly_loop_totals),
-    )
-
-
-def _bmesh_topology_signature(bm):
-    edge_vertices = []
-    loop_vertices = []
-    poly_loop_totals = []
-
-    for edge in bm.edges:
-        edge_vertices.extend((edge.verts[0].index, edge.verts[1].index))
-
-    for face in bm.faces:
-        poly_loop_totals.append(len(face.loops))
-        for loop in face.loops:
-            loop_vertices.append(loop.vert.index)
-
-    return (
-        _hash_int_sequence(edge_vertices),
-        _hash_int_sequence(loop_vertices),
-        _hash_int_sequence(poly_loop_totals),
-    )
-
-
 def _mesh_shape_signature(mesh):
     coords = [0.0] * (len(mesh.vertices) * 3)
     if coords:
         mesh.vertices.foreach_get("co", coords)
     quantized = [int(round(value * 100000.0)) for value in coords]
     return _hash_int_sequence(quantized)
+
+
+def _mesh_topology_signature(mesh):
+    edge_pairs = [0] * (len(mesh.edges) * 2)
+    if edge_pairs:
+        mesh.edges.foreach_get("vertices", edge_pairs)
+    return _hash_int_sequence(edge_pairs)
 
 
 def _bmesh_shape_signature(bm):
@@ -123,6 +78,18 @@ def _bmesh_shape_signature(bm):
             )
         )
     return _hash_int_sequence(quantized)
+
+
+def _bmesh_topology_signature(bm):
+    edge_pairs = []
+    for edge in bm.edges:
+        edge_pairs.extend(
+            (
+                min(edge.verts[0].index, edge.verts[1].index),
+                max(edge.verts[0].index, edge.verts[1].index),
+            )
+        )
+    return _hash_int_sequence(edge_pairs)
 
 
 def _faceset_signature(face_sets):
@@ -162,107 +129,31 @@ def get_mesh_attributes(mesh, bm=None):
         if face_count > 0:
             source.data.foreach_get("value", face_sets)
 
-    vert_count = len(mesh.vertices)
+    vert_count = len(bm.verts) if bm is not None else len(mesh.vertices)
     masks = [0.0] * vert_count
-    mask_attr = mesh.attributes.get(".sculpt_mask")
-    if mask_attr and mask_attr.domain == "POINT" and vert_count > 0:
-        mask_attr.data.foreach_get("value", masks)
+    if bm is not None:
+        mask_layer = bm.verts.layers.float.get(".sculpt_mask")
+        if mask_layer is not None:
+            for vert in bm.verts:
+                masks[vert.index] = vert[mask_layer]
+        else:
+            mask_attr = mesh.attributes.get(".sculpt_mask")
+            if (
+                mask_attr
+                and mask_attr.domain == "POINT"
+                and vert_count > 0
+                and len(mesh.vertices) == vert_count
+            ):
+                mask_attr.data.foreach_get("value", masks)
+    else:
+        mask_attr = mesh.attributes.get(".sculpt_mask")
+        if mask_attr and mask_attr.domain == "POINT" and vert_count > 0:
+            mask_attr.data.foreach_get("value", masks)
 
     return face_sets, masks
 
 
-def build_topology_data(bm, face_set_per_face, feature_angle):
-    vert_groups = defaultdict(set)
-    for face in bm.faces:
-        fset_id = face_set_per_face[face.index]
-        for vert in face.verts:
-            vert_groups[vert.index].add(fset_id)
-
-    vert_count = len(bm.verts)
-    vert_class = [0] * vert_count
-    inner_neighbors = [[] for _ in range(vert_count)]
-    boundary_neighbors = [[] for _ in range(vert_count)]
-
-    lock_enabled = feature_angle > 0.001
-    dot_threshold = -math.cos(feature_angle) if lock_enabled else 2.0
-
-    for vert in bm.verts:
-        idx = vert.index
-
-        if any(len(edge.link_faces) > 2 for edge in vert.link_edges):
-            continue
-
-        open_edges = [edge for edge in vert.link_edges if len(edge.link_faces) == 1]
-        fset_count = len(vert_groups[idx])
-
-        if fset_count >= 3:
-            continue
-
-        if open_edges:
-            if fset_count >= 2 or len(open_edges) != 2:
-                continue
-            vert_class[idx] = 3
-        else:
-            if fset_count == 1:
-                vert_class[idx] = 1
-            elif fset_count == 2:
-                vert_class[idx] = 2
-            else:
-                continue
-
-    for vert in bm.verts:
-        idx = vert.index
-        cls = vert_class[idx]
-
-        if cls == 1:
-            inner_neighbors[idx] = [edge.other_vert(vert).index for edge in vert.link_edges]
-
-        elif cls == 2:
-            boundary_neighbor_verts = []
-            for edge in vert.link_edges:
-                if len(edge.link_faces) != 2:
-                    continue
-                fset_a = face_set_per_face[edge.link_faces[0].index]
-                fset_b = face_set_per_face[edge.link_faces[1].index]
-                if fset_a != fset_b:
-                    boundary_neighbor_verts.append(edge.other_vert(vert))
-
-            if len(boundary_neighbor_verts) != 2:
-                vert_class[idx] = 0
-                continue
-
-            if lock_enabled:
-                v1 = (boundary_neighbor_verts[0].co - vert.co).normalized()
-                v2 = (boundary_neighbor_verts[1].co - vert.co).normalized()
-                if v1.dot(v2) >= dot_threshold:
-                    vert_class[idx] = 0
-                    continue
-
-            boundary_neighbors[idx] = [boundary_neighbor_verts[0].index, boundary_neighbor_verts[1].index]
-
-        elif cls == 3:
-            boundary_neighbor_verts = [edge.other_vert(vert) for edge in vert.link_edges if len(edge.link_faces) == 1]
-            if len(boundary_neighbor_verts) != 2:
-                vert_class[idx] = 0
-                continue
-
-            if lock_enabled:
-                v1 = (boundary_neighbor_verts[0].co - vert.co).normalized()
-                v2 = (boundary_neighbor_verts[1].co - vert.co).normalized()
-                if v1.dot(v2) >= dot_threshold:
-                    vert_class[idx] = 0
-                    continue
-
-            boundary_neighbors[idx] = [boundary_neighbor_verts[0].index, boundary_neighbor_verts[1].index]
-
-    return (
-        _to_numpy_int_array(vert_class),
-        _neighbor_matrix(inner_neighbors),
-        _neighbor_matrix(boundary_neighbors),
-    )
-
-
-def get_or_build_topology(mesh, face_set_per_face, feature_angle, bm=None):
+def get_or_build_topology(mesh, face_set_per_face, feature_angle, bm=None, single_faceset=False):
     shape_signature = 0
     topology_signature = _bmesh_topology_signature(bm) if bm is not None else _mesh_topology_signature(mesh)
     vert_count = len(bm.verts) if bm is not None else len(mesh.vertices)
@@ -277,7 +168,9 @@ def get_or_build_topology(mesh, face_set_per_face, feature_angle, bm=None):
         f"{edge_count}:"
         f"{face_count}:"
         f"{round(feature_angle, 6)}:"
-        f"{_faceset_signature(face_set_per_face)}:"
+        f"{int(single_faceset)}:"
+        f"{0 if single_faceset else _faceset_signature(face_set_per_face)}:"
+        f"{_mesh_topology_versions.get(int(mesh.as_pointer()), 0)}:"
         f"{topology_signature}:"
         f"{shape_signature}"
     )
@@ -295,7 +188,10 @@ def get_or_build_topology(mesh, face_set_per_face, feature_angle, bm=None):
             work_bm.from_mesh(mesh)
         work_bm.verts.ensure_lookup_table()
         work_bm.faces.ensure_lookup_table()
-        data = build_topology_data(work_bm, face_set_per_face, feature_angle)
+        if single_faceset:
+            data = build_single_faceset_topology_data(work_bm, feature_angle)
+        else:
+            data = build_topology_data(work_bm, face_set_per_face, feature_angle)
     finally:
         if owns_bmesh:
             work_bm.free()
@@ -312,6 +208,9 @@ def _active_mesh_and_bmesh(obj):
     mesh = obj.data
     if obj.mode == "EDIT":
         bm = bmesh.from_edit_mesh(mesh)
+        bm.verts.index_update()
+        bm.edges.index_update()
+        bm.faces.index_update()
         bm.verts.ensure_lookup_table()
         bm.edges.ensure_lookup_table()
         bm.faces.ensure_lookup_table()
@@ -319,22 +218,108 @@ def _active_mesh_and_bmesh(obj):
     return mesh, None
 
 
-def _object_mode_selection_mask(mesh, mask_list):
-    vert_count = len(mesh.vertices)
-    if vert_count == 0:
-        return
-
-    sel_state = [False] * vert_count
-    mesh.vertices.foreach_get("select", sel_state)
-    for index, is_selected in enumerate(sel_state):
-        if not is_selected:
-            mask_list[index] = 1.0
+def _face_count(mesh, bm=None):
+    return len(bm.faces) if bm is not None else len(mesh.polygons)
 
 
-def _edit_mode_selection_mask(bm, mask_list):
-    for vert in bm.verts:
-        if not vert.select:
-            mask_list[vert.index] = 1.0
+def _validate_runtime_arrays(vert_class, mask_array, cur_pos):
+    vert_count = len(vert_class)
+    issues = []
+
+    if mask_array.shape[0] != vert_count:
+        issues.append(f"mask count {mask_array.shape[0]} does not match vertex count {vert_count}")
+
+    if cur_pos.shape[0] != vert_count:
+        issues.append(f"coordinate count {cur_pos.shape[0]} does not match vertex count {vert_count}")
+
+    if issues:
+        raise RuntimeError("FST ForgePolish data mismatch: " + "; ".join(issues))
+
+
+def _complete_selected_faces(bm, allow_inferred=False):
+    selected_faces = [
+        face
+        for face in bm.faces
+        if face.select and all(edge.select for edge in face.edges)
+    ]
+    if selected_faces or not allow_inferred:
+        return selected_faces
+
+    return [face for face in bm.faces if all(vert.select for vert in face.verts)]
+
+
+def _selected_edges_from_selection(bm, allow_inferred=False):
+    selected_edges = [edge for edge in bm.edges if edge.select]
+    if selected_edges or not allow_inferred:
+        return selected_edges
+
+    return [edge for edge in bm.edges if all(vert.select for vert in edge.verts)]
+
+
+def _select_history_items(bm, item_type):
+    return [item for item in bm.select_history if isinstance(item, item_type) and item.select]
+
+
+def _selected_edges_form_complete_selected_faces(selected_edges, selected_faces):
+    if not selected_edges or not selected_faces:
+        return False
+
+    face_edges = {edge for face in selected_faces for edge in face.edges}
+    return set(selected_edges).issubset(face_edges)
+
+
+def _selected_vertices(bm):
+    return [vert for vert in bm.verts if vert.select]
+
+
+def _selected_face_mask(bm, selected_faces):
+    mask_list = [1.0] * len(bm.verts)
+    for face in selected_faces:
+        for vert in face.verts:
+            mask_list[vert.index] = 0.0
+    return mask_list
+
+
+def _selected_vert_mask(bm, selected_verts):
+    mask_list = [1.0] * len(bm.verts)
+    for vert in selected_verts:
+        mask_list[vert.index] = 0.0
+    return mask_list
+
+
+def _edge_vertex_key(edge):
+    return tuple(sorted((edge.verts[0].index, edge.verts[1].index)))
+
+
+def _faceset_boundary_edge_keys(selected_edges, face_sets):
+    if face_sets is None:
+        return None
+
+    selected_edge_keys = {_edge_vertex_key(edge) for edge in selected_edges}
+    boundary_edge_keys = set()
+
+    for edge in selected_edges:
+        if len(edge.link_faces) != 2:
+            continue
+
+        fset_a = face_sets[edge.link_faces[0].index]
+        fset_b = face_sets[edge.link_faces[1].index]
+        if fset_a != fset_b:
+            boundary_edge_keys.add(_edge_vertex_key(edge))
+
+    for edge in selected_edges:
+        for vert in edge.verts:
+            for linked_edge in vert.link_edges:
+                key = _edge_vertex_key(linked_edge)
+                if key in selected_edge_keys or len(linked_edge.link_faces) != 2:
+                    continue
+
+                fset_a = face_sets[linked_edge.link_faces[0].index]
+                fset_b = face_sets[linked_edge.link_faces[1].index]
+                if fset_a != fset_b:
+                    boundary_edge_keys.add(key)
+
+    return boundary_edge_keys
 
 
 def _get_coordinates(mesh, bm=None):
@@ -347,12 +332,25 @@ def _get_coordinates(mesh, bm=None):
     return np.asarray([(vert.co.x, vert.co.y, vert.co.z) for vert in bm.verts], dtype=np.float32)
 
 
-def _write_coordinates(mesh, coords, bm=None):
+def _tag_view3d_redraw(context):
+    screen = getattr(context, "screen", None)
+    if screen is None:
+        return
+
+    for area in screen.areas:
+        if area.type == "VIEW_3D":
+            area.tag_redraw()
+
+
+def _write_coordinates(mesh, coords, bm=None, context=None):
     if bm is None:
         flat_coords = coords.reshape(-1).tolist()
         if flat_coords:
             mesh.vertices.foreach_set("co", flat_coords)
         mesh.update()
+        mesh.update_tag()
+        if context is not None:
+            _tag_view3d_redraw(context)
         return
 
     for index, vert in enumerate(bm.verts):
@@ -361,34 +359,39 @@ def _write_coordinates(mesh, coords, bm=None):
         vert.co.y = float(co[1])
         vert.co.z = float(co[2])
 
-    bmesh.update_edit_mesh(mesh, loop_triangles=False, destructive=False)
+    bm.normal_update()
+    bmesh.update_edit_mesh(mesh, loop_triangles=True, destructive=False)
+    mesh.update()
+    mesh.update_tag()
+    if context is not None:
+        _tag_view3d_redraw(context)
 
 
-def execute_polish(context):
-    obj = context.active_object
-    props = context.scene.sharp_polish_props
-    mesh, bm = _active_mesh_and_bmesh(obj)
-
+def _execute_surface_polish(context, mesh, bm=None, mask_override=None):
+    props = context.scene.fst_forgepolish_props
     face_set_per_face, mask_list = get_mesh_attributes(mesh, bm)
+    single_faceset = _uses_whole_mesh(face_set_per_face)
     if _uses_whole_mesh(face_set_per_face):
-        face_set_per_face = [1] * len(mesh.polygons)
+        face_set_per_face = [1] * _face_count(mesh, bm)
 
-    if props.mask_unselected and bm is not None:
-        if bm is not None:
-            _edit_mode_selection_mask(bm, mask_list)
+    if mask_override is not None:
+        mask_list = mask_override
 
     vert_class, inner_neighbors, boundary_neighbors = get_or_build_topology(
         mesh,
         face_set_per_face,
         props.feature_angle,
         bm=bm,
+        single_faceset=single_faceset,
     )
 
+    cur_pos = _get_coordinates(mesh, bm=bm).copy()
     mask_array = np.asarray(mask_list, dtype=np.float32)
+    _validate_runtime_arrays(vert_class, mask_array, cur_pos)
+
     active_inner = np.flatnonzero((vert_class == 1) & (mask_array < 1.0)).astype(np.int32)
     active_bound = np.flatnonzero(((vert_class == 2) | (vert_class == 3)) & (mask_array < 1.0)).astype(np.int32)
     active_all = np.concatenate((active_inner, active_bound)).astype(np.int32)
-    cur_pos = _get_coordinates(mesh, bm=bm).copy()
     next_pos = cur_pos.copy()
     if props.algorithm_mode == "STANDARD":
         orig_pos = cur_pos.copy()
@@ -399,7 +402,7 @@ def execute_polish(context):
 
     if props.algorithm_mode == "TENSION":
         run_tension_polish(
-            props.iterations,
+            props.iterations * 0.5,
             props.strength,
             props.boundary_strength,
             active_inner,
@@ -430,15 +433,114 @@ def execute_polish(context):
             b_err,
         )
 
-    _write_coordinates(mesh, cur_pos, bm=bm)
-    return PolishResult.SUCCESS
+    _write_coordinates(mesh, cur_pos, bm=bm, context=context)
+
+
+def _execute_edge_polish(context, mesh, bm, selected_edges):
+    props = context.scene.fst_forgepolish_props
+    if not selected_edges:
+        return 0
+
+    face_sets, mask_list = get_mesh_attributes(mesh, bm)
+    mask_array = np.asarray(mask_list, dtype=np.float32)
+    coords = _get_coordinates(mesh, bm=bm).copy()
+    boundary_edge_keys = _faceset_boundary_edge_keys(selected_edges, face_sets)
+
+    result_coords, moved_count = polish_selected_edge_chains(
+        selected_edges,
+        coords,
+        mask_array,
+        max(1, int((props.iterations * EDGE_POLISH_ITERATION_SCALE) + 0.5)),
+        props.boundary_strength,
+        feature_angle=props.feature_angle,
+        boundary_edge_keys=boundary_edge_keys,
+    )
+
+    if moved_count > 0:
+        _write_coordinates(mesh, result_coords, bm=bm, context=context)
+    return moved_count
+
+
+def execute_polish(context):
+    obj = context.active_object
+    mesh, bm = _active_mesh_and_bmesh(obj)
+
+    if bm is None:
+        _execute_surface_polish(context, mesh, bm=None)
+        return PolishResult.WHOLE_MESH
+
+    history_edges = _select_history_items(bm, bmesh.types.BMEdge)
+    history_faces = _select_history_items(bm, bmesh.types.BMFace)
+    selected_faces = _complete_selected_faces(bm)
+    selected_edges = _selected_edges_from_selection(bm)
+
+    edge_candidates = selected_edges or history_edges
+    if edge_candidates and not _selected_edges_form_complete_selected_faces(edge_candidates, selected_faces):
+        moved_count = _execute_edge_polish(context, mesh, bm, edge_candidates)
+        if moved_count > 0:
+            return PolishResult.SELECTED_EDGES
+        return PolishResult.SELECTED_EDGES_LOCKED
+
+    if history_faces and not history_edges:
+        _execute_surface_polish(
+            context,
+            mesh,
+            bm=bm,
+            mask_override=_selected_face_mask(bm, history_faces),
+        )
+        return PolishResult.SELECTED_FACES
+
+    if selected_faces:
+        _execute_surface_polish(
+            context,
+            mesh,
+            bm=bm,
+            mask_override=_selected_face_mask(bm, selected_faces),
+        )
+        return PolishResult.SELECTED_FACES
+
+    if selected_edges:
+        moved_count = _execute_edge_polish(context, mesh, bm, selected_edges)
+        if moved_count > 0:
+            return PolishResult.SELECTED_EDGES
+        return PolishResult.SELECTED_EDGES_LOCKED
+
+    selected_faces = _complete_selected_faces(bm, allow_inferred=True)
+    if selected_faces:
+        _execute_surface_polish(
+            context,
+            mesh,
+            bm=bm,
+            mask_override=_selected_face_mask(bm, selected_faces),
+        )
+        return PolishResult.SELECTED_FACES
+
+    selected_edges = _selected_edges_from_selection(bm, allow_inferred=True)
+    if selected_edges:
+        moved_count = _execute_edge_polish(context, mesh, bm, selected_edges)
+        if moved_count > 0:
+            return PolishResult.SELECTED_EDGES
+        return PolishResult.SELECTED_EDGES_LOCKED
+
+    selected_verts = _selected_vertices(bm)
+    if selected_verts:
+        _execute_surface_polish(
+            context,
+            mesh,
+            bm=bm,
+            mask_override=_selected_vert_mask(bm, selected_verts),
+        )
+        return PolishResult.SELECTED_VERTS
+
+    _execute_surface_polish(context, mesh, bm=bm)
+    return PolishResult.WHOLE_MESH
 
 
 class _MeshOperatorMixin:
     @classmethod
     def poll(cls, context):
         obj = context.active_object
-        return obj is not None and obj.type == "MESH" and obj.mode in {"OBJECT", "EDIT"}
+        return obj is not None and obj.type == "MESH" and obj.mode in {"OBJECT", "EDIT", "SCULPT"}
 
 
 class _EditMeshOperatorMixin:
@@ -605,15 +707,15 @@ class MESH_OT_select_faceset_boundaries(_EditMeshOperatorMixin, bpy.types.Operat
         return {"FINISHED"}
 
 
-class MESH_OT_sharp_polish_groups(_MeshOperatorMixin, bpy.types.Operator):
-    bl_idname = "mesh.sharp_polish_groups"
+class MESH_OT_fst_forgepolish_groups(_MeshOperatorMixin, bpy.types.Operator):
+    bl_idname = "mesh.fst_forgepolish_groups"
     bl_label = "Execute Polish"
-    bl_description = "Apply SharpPolish to the active mesh using the current settings"
+    bl_description = "Apply FST ForgePolish to the active mesh using the current settings"
     bl_options = {"REGISTER", "UNDO"}
 
     def execute(self, context):
         try:
-            execute_polish(context)
+            result = execute_polish(context)
         except Exception as exc:
             traceback.print_exc()
             self.report(
@@ -621,5 +723,16 @@ class MESH_OT_sharp_polish_groups(_MeshOperatorMixin, bpy.types.Operator):
                 rpt_("Execution failed. See the console for details: %s") % exc,
             )
             return {"CANCELLED"}
+
+        messages = {
+            PolishResult.WHOLE_MESH: "Polished the whole mesh.",
+            PolishResult.SELECTED_FACES: "Polished the selected face area.",
+            PolishResult.SELECTED_EDGES: "Polished the selected edge chain.",
+            PolishResult.SELECTED_EDGES_LOCKED: "Selected edge chain did not move. Endpoints, masks, or strength may be locking it.",
+            PolishResult.SELECTED_VERTS: "Polished the selected vertices.",
+        }
+        message = messages.get(result)
+        if message:
+            self.report({"INFO"}, rpt_(message))
 
         return {"FINISHED"}
